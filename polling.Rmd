@@ -1,10 +1,14 @@
 ---
-title: "Untitled"
+title: "Pooling the Polls in the 2016 US Presidential Election"
 author: "Jeffrey Arnold"
-date: "5/31/2017"
 output: html_document
 ---
 
+In this example we'll model the popular vote in the 2016 US presidential election.
+
+# Prerequisites
+
+This example will use tidyverse packages, **pollstR** for accessing the Huffington Post Pollster API, and **rstan**.
 ```{r message=FALSE}
 library("tidyverse")
 library("stringr")
@@ -13,25 +17,46 @@ library("pollstR")
 library("rstan")
 ```
 
-All national polls in the Huffington Post Pollster database:
+# Data
+
+For this we'll use all national polls in the [Huffington Post Pollster](http://elections.huffingtonpost.com/pollster/2016-general-election-trump-vs-clinton) database:
+
+```{r message=FALSE}
+polls <- pollster_charts_polls("2016-general-election-trump-vs-clinton")
+```
 ```{r}
-polls <- pollster_charts_polls("2016-general-election-trump-vs-clinton") %>%
+polls <- polls %>%
   `[[`("content") %>%
   # calculate the mid-date for date ranges of polls
   mutate(n_days = as.integer(difftime(end_date, start_date, units = "days")) + 1L,
          mid_date = start_date + ddays(ceiling(n_days / 2))) %>%
   # convert from 0-100 to 0-1
-  mutate_at(vars(Trump, Clinton, Other, Undecided), funs(. / 100)) %>%
+  mutate_at(vars(Trump, Clinton, Other, Undecided,
+                 margin_of_error), funs(. / 100)) %>%
   # calculate shares that ignore missing values
   mutate(Clinton_Trump_share = Clinton + Trump,
          Clinton_adj = Clinton / Clinton_Trump_share,
          Trump_adj = Trump / Clinton_Trump_share) %>%
-  # add polling standard errors
-  mutate_at(vars(Clinton, Trump, Clinton_adj, Trump_adj), 
-            funs(se = sqrt(. * (1 - .) / observations)))
+  # add standard errors
+  # use margin of error, or calculate it from the observations
+  mutate(std_err = if_else(!is.na(margin_of_error),
+                           margin_of_error / 2,
+                           0.5 / sqrt(observations))) %>%
+  # add weekly date
+  mutate(week_date = as.Date(ceiling_date(mid_date, "week")))
 
+# add week numbers
+weeks <- polls %>%
+  select(week_date) %>%
+  distinct() %>%
+  arrange(week_date) %>%
+  mutate(week_num = row_number())
+
+polls <- polls %>%
+  left_join(weeks, by = "week_date")
 ```
-The election result on November 8, 2016 (popular vote):
+
+We'll also add the popular vote results for the election on [November 8, 2016](https://en.wikipedia.org/wiki/United_States_presidential_election,_2016):
 ```{r}
 election_result <- tibble(Clinton_n = 65853516,
                           Trump_n = 62984825,
@@ -39,38 +64,76 @@ election_result <- tibble(Clinton_n = 65853516,
                           date = as.Date("2016-11-08")) %>%
   mutate(Clinton_adj = Clinton_n / (Clinton_n + Trump_n),
          Clinton = Clinton_n / total_votes)
-                          
+```
+We'll focus on the period after July 1st when there is 
+```{r}
+START_DATE <- as.Date("2016-07-01")
+polls_jul_plus <- filter(polls, mid_date > START_DATE)
 ```
 
-Let's plot the data:
+In these examples we'll focus on the variable `Clinton_adj`: which is the proportion of those supporting Hillary Clinton, considering only those respondents answering Clinton or Donald Trump, and ignoring other candidates and undecided responses.
 ```{r}
-ggplot(filter(general_elec, mid_date > as.Date("2016-07-01")),
+ggplot(filter(polls, mid_date > as.Date("2016-07-01")),
        aes(x = mid_date, y = Clinton_adj)) +
   geom_hline(yintercept = 0.5, colour = "white", size = 2) +
   geom_point() +
   labs(x = "", y = "Clinton vs. Trump")
 ```
 
-A first cut. For each week, calculate mean and standard deviation of the pools.
-```{r}
-polls_weekly <-
-  polls %>%
-  mutate(week_date = ceiling_date(mid_date, "week") - ddays(3.5)) %>%
-  filter(week_date > as.Date("2016-07-01"),
-         week_date < as.Date("2016-11-08")) %>%
-  group_by(week_date) %>%
-  summarise(Clinton_adj = weighted.mean(Clinton_adj, observations),
-            observations = sum(observations)) %>%
-  mutate(Clinton_adj_se =
-           sqrt(Clinton_adj * (1 - Clinton_adj) / observations))
+Each poll provides a different estimate of Clinton's support, and the question is how can we efficiently aggregate them as a measure of Clinton's support over time.
 
+# Independent Weeks
+
+A simplest model would be to split up the polls into some time periods, for example, weeks, and then aggregate the polls within each week.
+
+Let $y_i$ be the proportion answering "Clinton" in poll $i$, $w[i]$ be the
+week $w = 1, \dots, W$ of poll $i$, and $s_i$ be the given standard error (margin of error / 2) of poll $i$.
+A model the support for Clinton in each week, $\theta_{w[i]}$, is
+$$
+y_i \sim \mathsf{Normal}(\theta_{w[i]}, s_i)  .
+$$
+The model 
+```{r results='hide'}
+mod_polling0 <- stan_model("polling0.stan")
+```
+```{r comment=''}
+mod_polling0
+```
+
+```{r}
+data_polling0 <- within(list(), {
+  y <- polls_jul_plus$Clinton_adj
+  N <- length(y)
+  s <- polls_jul_plus$Clinton_adj
+  T <- max(polls_jul_plus$week_num)
+  time <- polls_jul_plus$week_num
+  # very weak priors of 0.5 +/- 1
+  theta_loc <- 0.5
+  theta_scale <- 0.25
+})
+```
+```{r results='hide'}
+fit_polling0 <- sampling(mod_polling0, data = data_polling0)
+```
+
+Extract $\theta$ and merge with the dates:
+```{r}
+theta0 <- 
+  summary(fit_polling0, par = "theta")$summary %>%
+  as.data.frame() %>%
+  mutate(week_num = row_number()) %>%
+  left_join(weeks, by = "week_num")
+```
+
+
+```{r}
 ggplot() +
   geom_hline(yintercept = 0.5, colour = "white", size = 2) +  
-  geom_pointrange(data = polls_weekly,
-                  mapping = aes(x = as.Date(week_date),
-                                y = Clinton_adj,
-                                ymin = Clinton_adj - 2 * Clinton_adj_se,
-                                ymax = Clinton_adj + 2 * Clinton_adj_se)) +
+  geom_ribbon(data = theta0,
+              mapping = aes(x = week_date,
+                            ymin = `2.5%`, ymax = `97.5%`)) +
+  geom_line(data = theta0,
+              mapping = aes(x = week_date, y = mean)) +
   geom_point(data = filter(polls, mid_date > as.Date("2016-07-01")), 
              mapping = aes(x = mid_date, y = Clinton_adj), 
              alpha = 0.5) +
@@ -79,13 +142,23 @@ ggplot() +
 ```
 
 
-```{r}
-START_DATE <- as.Date("2016-07-01")
-elec_jul_plus <- filter(general_elec, mid_date > START_DATE)
-```
+# Local Level Model with known $\tau$
+
+A dynamic model called a "local level" model gives a prior to each day.
+$$
+\begin{aligned}[t]
+y_i &\sim \mathsf{Normal}(\mu_i, s_i^2)  & i = 1, \dots, N \\
+\mu_i &= \theta_{t[i]} \\
+\theta_1 &\sim \mathsf{Normal}(m_{\theta_1}, s_{\theta_1}) \\
+\theta_t &\sim \mathsf{Normal}(\theta_{t - 1}, \tau^2) & t = 2, \dots, T \\
+\end{aligned}
+$$
+
+The model `polling1.stan` treats $\tau$ as data to be chosen.
+Smaller values of $\tau$ smooth the data more, and larger values smooth the data less.
 ```{r}
 theta1_prior <- 
-  filter(general_elec, mid_date > as.Date("2016-06-15"),
+  filter(polls, mid_date > as.Date("2016-06-15"),
          mid_date < as.Date("2016-07-01")) %>%
   summarise_at(vars(Clinton_adj), funs(mean, sd))
 
@@ -94,6 +167,8 @@ polling_data <-
     y <- elec_jul_plus$Clinton_adj
     s <- elec_jul_plus$Clinton_adj_se
     N <- length(y)
+    H <- length(unique(elec_jul_plus$survey_house))
+    house <- as.integer(factor(elec_jul_plus$survey_house))
     time <- as.integer(difftime(elec_jul_plus$mid_date, START_DATE),
                        units = "days") + 1L
     T <- as.integer(difftime(as.Date("2016-11-08"),
@@ -108,34 +183,74 @@ mod_polling1 <- stan_model("polling1.stan")
 ```
 
 ```{r}
-fit_polling1 <- sampling(mod_polling1, data = append(polling_data, list(tau = 0.02)),
-         init = 0, chains = 1)
+fit_polling1 <- sampling(mod_polling1,
+                         data = append(polling_data,  list(tau = 0.01)),
+                         init = 0, chains = 1)
 ```
 
 ```{r}
-time2date <- tibble(date = seq(START_DATE, election_result$date, "day")) %>%
-  mutate(time = row_number())
-
-theta_polling <-                     
-  summary(fit_polling1, par = "theta")$summary %>%
-  as.data.frame() %>%
-  mutate(time = row_number()) %>%
-  left_join(time2date, by = "time")
-
-ggplot(theta_polling, aes(x = date, y = mean)) +
-  geom_point() +
-  labs(x = "", y = "Clinton v. Trump")
-
+plot_theta <- function(fit) {
+  
+  time2date <- tibble(date = seq(START_DATE, election_result$date, "day")) %>%
+    mutate(time = row_number())
+  
+  theta_polling <-                     
+    summary(fit, par = "theta")$summary %>%
+    as.data.frame() %>%
+    mutate(time = row_number()) %>%
+    left_join(time2date, by = "time")
+  
+  ggplot() +
+    geom_ribbon(data = theta_polling,
+                mapping = aes(x = date, ymin = `2.5%`, ymax = `97.5%`), alpha = 0.3) +
+    geom_line(data = theta_polling,
+               mapping = aes(x = date, y = mean)) +  
+    geom_point(data = theta_polling,
+               mapping = aes(x = date, y = mean)) +
+    geom_point(data = filter(polls, mid_date > as.Date("2016-07-01")),
+               mapping = aes(x = mid_date, y = Clinton_adj),
+               colour = "red") +
+    labs(x = "", y = "Clinton v. Trump")  
+}
+plot_theta(fit_polling1)
 ```
 
+# Local Level Model with Unknown $\tau$
+
+Now take the previous model and estimate the variance of the innovations, $\tau$, and assign it a prior:
+$$
+\begin{aligned}[t]
+y_i &\sim \mathsf{Normal}(\mu_i, s_i^2)  & i = 1, \dots, N \\
+\mu_i &= \theta_{t[i]} \\
+\theta_1 &\sim \mathsf{Normal}(m_{\theta_1}, s_{\theta_1}^2) \\
+\theta_t &\sim \mathsf{Normal}(\theta_{t - 1}, \tau^2) & t = 2, \dots, T \\
+\tau &\sim \mathsf{HalfCauchy}(0, s_{\tau})
+\end{aligned}
+$$
 
 ```{r}
 mod_polling2 <- stan_model("polling2.stan")
 ```
+```{r}
+mod_polling2
+```
+
+```{r}
+fit_polling2 <- sampling(mod_polling2,
+                         data = append(polling_data,  list(tau_scale = 0.01)),
+                         init = 0, chains = 1)
+```
+
+```{r}
+plot_theta(fit_polling2)
+```
 
 
+# House Effects
 
-Suppose we want to add house effects, for polling houses $h \in 1, \dots H$.
+Different polling firms may produce biased estimates.
+
+Each poll is produced by a polling house, $h \in 1, \dots H$.
 $$
 \begin{aligned}[t]
 y_i &\sim \mathsf{Normal}(\mu_i, s_i^2)  & i = 1, \dots, N \\
@@ -143,36 +258,57 @@ y_i &\sim \mathsf{Normal}(\mu_i, s_i^2)  & i = 1, \dots, N \\
 \theta_1 &\sim \mathsf{Normal}(m_{\theta_1}, s_{\theta_1}) \\
 \theta_t &\sim \mathsf{Normal}(\theta_{t - 1}, \tau^2) & t = 2, \dots, T \\
 \eta_h &\sim \mathsf{Normal}(0, \zeta) & h = 1, \dots, H
-\end{aligned}
-$$
-with priors on $\tau$ and $\zeta$,
-$$
-\begin{aligned}[t]
 \tau &\sim \mathsf{HalfCauchy}(0, s_{\tau}) \\
 \zeta &\sim \mathsf{HalfCauchy}(0, s_{\zeta})
 \end{aligned}
 $$
 
+```{r}
+mod_polling3 <- stan_model("polling3.stan")
+```
+```{r}
+mod_polling3
+```
+
+```{r}
+fit_polling3 <- sampling(mod_polling3,
+                         data = append(polling_data,  list(tau_scale = 0.01, zeta_scale = 0.1)),
+                         init = 0, chains = 1)
+```
+
+```{r}
+plot_theta(fit_polling3)
+```
+
+**TODO** Plot the house effects
+
+
+# Extensions
+
 1. Interpret each of the following, and implement if possible.
 
     1. Model $y$ as:
-    $$
-    y_i \sim \mathsf{StudentT}(4, \mu_i, s_i) 
-    $$
-    2. Model $\theta_t$ as:
-    $$
-    \theta_t \sim \mathsf{StudentT}(4, \theta_{t - 1}, \tau) 
-    $$
-    3. Model $\tau$ as:
-    $$
-    \begin{aligned}[t]
-    \theta_t &\sim \mathsf{Normal}(\theta_{t - 1}, \tau_t)  \\
-    \log(\tau_t) &\sim \mathsf{Normal}(\gamma + \rho \tau_{t-1}, \sigma^2) & \rho \in     (0, 1)
-    \end{aligned}
-    $$
+    
+        $$
+        y_i \sim \mathsf{StudentT}(4, \mu_i, s_i) 
+        $$
 
-1. Currently house effects allow for a pollster to be biased. How would you model
-    these generalizations?
+    2. Model $\theta_t$ as:
+    
+        $$
+        \theta_t \sim \mathsf{StudentT}(4, \theta_{t - 1}, \tau) 
+        $$
+
+    3. Model $\tau$ as:
+    
+        $$
+        \begin{aligned}[t]
+        \theta_t &\sim \mathsf{Normal}(\theta_{t - 1}, \tau_t)  \\
+        \log(\tau_t) &\sim \mathsf{Normal}(\gamma + \rho \tau_{t-1}, \sigma^2) & \rho \in     (0, 1)
+        \end{aligned}
+        $$
+
+1. Currently house effects allow for a pollster to be biased. How would you model these generalizations?
     
     1. Party affiliation
     2. Some pollsters are have more variable polls than others
@@ -180,7 +316,7 @@ $$
     
 2. We know the result of the actual election. Using this as a model of public opinion (voting intentions), how would you incorporate that into the model?
 
-3. There are multiple sample subpopulations in the data. How would you model them?
+3. There are multiple sample subpopulations (Adults, Registered Voters, Likely Voters) in the data. How would you incorporate them into a model?
 
 4. We have treated the outcome as continuous. However, this is an approximation.
 
@@ -191,7 +327,7 @@ $$
 5. What if instead of this model, we estimated each week separately using `normal.stan`?
 
     1. Use the previous week's polls as a prior?
-    
+    2. Use the results of the previous week to make a prior?
 
 
 ## State Level Analysis
@@ -208,4 +344,3 @@ us_elec_states <-
 ```
 
 This would be necessary to model electoral votes and the election outcome.
-

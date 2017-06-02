@@ -44,7 +44,7 @@ transformed parameters {
   // if these aren't set so that the mean is exactly 0, I found it was
   // hard to identify theta.
   vector[H] eta;
-  eta = ((eta_raw - mean(eta_raw)) / sd(eta_raw)) * zeta;
+  eta = eta_raw * zeta;
   // polling mean
   theta[1] = theta_init_loc + omega_raw[1] * theta_init_scale;
   for (t in 2:T) {
@@ -59,11 +59,11 @@ model {
   eta_raw ~ normal(0., 1.);
   tau ~ cauchy(0., tau_scale);
   omega_raw ~ normal(0., 1.);
-  y ~ normal(theta, s);
+  y ~ normal(mu, s);
 }
 generated quantities {
-  vector[N] log_lik;
-  for (i in 1:N) {
-    log_lik[i] = normal_lpdf(y[i] | theta[i], s[i]);
-  }
+  // vector[N] log_lik;
+  // for (i in 1:N) {
+  //   log_lik[i] = normal_lpdf(y[i] | mu[i], s[i]);
+  // }
 }
